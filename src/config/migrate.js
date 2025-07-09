@@ -62,14 +62,16 @@ const createTables = async () => {
             CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
         `);
 
-        // Create chat table with JSONB support (PostgreSQL)
+        // Create chat table with JSONB support (PostgreSQL) - Updated to match ChatController
         console.log('💬 Creating chat table...');
         await client.query(`
             CREATE TABLE IF NOT EXISTS chat (
                 id SERIAL PRIMARY KEY,
                 user_id VARCHAR(255) NOT NULL,
                 conversation JSONB NOT NULL,
-                status VARCHAR(50) DEFAULT 'incomplete',
+                status VARCHAR(50) DEFAULT 'not_started',
+                current_stage INTEGER DEFAULT 0,
+                concept_name VARCHAR(255),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -91,6 +93,12 @@ const createTables = async () => {
         await client.query(`
             CREATE INDEX IF NOT EXISTS idx_chat_user_created ON chat(user_id, created_at DESC);
         `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_chat_current_stage ON chat(current_stage);
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_chat_concept_name ON chat(concept_name);
+        `);
 
         // Add additional indexes for better performance
         console.log('📈 Adding performance indexes...');
@@ -100,23 +108,49 @@ const createTables = async () => {
         await client.query(`
             CREATE INDEX IF NOT EXISTS idx_chat_status_created ON chat(status, created_at DESC);
         `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_chat_user_concept ON chat(user_id, concept_name);
+        `);
+        await client.query(`
+            CREATE INDEX IF NOT EXISTS idx_chat_user_stage ON chat(user_id, current_stage);
+        `);
 
-        // Add status constraint for chat table
+        // Drop old constraint if it exists and add new one matching ChatController
         console.log('🔒 Adding chat status constraints...');
         await client.query(`
             DO $$ 
             BEGIN
-                -- Check if constraint exists, if not create it
-                IF NOT EXISTS (
+                -- Drop old constraint if it exists
+                IF EXISTS (
                     SELECT 1 FROM information_schema.table_constraints 
                     WHERE constraint_name = 'chk_chat_status' 
                     AND table_name = 'chat'
                 ) THEN
-                    ALTER TABLE chat ADD CONSTRAINT chk_chat_status 
-                    CHECK (status IN ('incomplete', 'paused', 'completed', 'stopped', 'archived'));
-                    RAISE NOTICE 'Added chat status constraint';
+                    ALTER TABLE chat DROP CONSTRAINT chk_chat_status;
+                    RAISE NOTICE 'Dropped old chat status constraint';
+                END IF;
+                
+                -- Add new constraint matching ChatController
+                ALTER TABLE chat ADD CONSTRAINT chk_chat_status 
+                CHECK (status IN ('not_started', 'inprogress', 'completed'));
+                RAISE NOTICE 'Added new chat status constraint';
+            END $$;
+        `);
+
+        // Add stage constraint
+        await client.query(`
+            DO $$ 
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints 
+                    WHERE constraint_name = 'chk_chat_stage' 
+                    AND table_name = 'chat'
+                ) THEN
+                    ALTER TABLE chat ADD CONSTRAINT chk_chat_stage 
+                    CHECK (current_stage >= 0 AND current_stage <= 5);
+                    RAISE NOTICE 'Added chat stage constraint';
                 ELSE
-                    RAISE NOTICE 'Chat status constraint already exists';
+                    RAISE NOTICE 'Chat stage constraint already exists';
                 END IF;
             END $$;
         `);
@@ -158,17 +192,51 @@ const createTables = async () => {
                 EXECUTE FUNCTION update_updated_at_column();
         `);
 
-        // Clean up any invalid chat statuses (if any exist)
-        console.log('🧹 Cleaning up invalid chat statuses...');
-        const updateResult = await client.query(`
-            UPDATE chat SET status = 'incomplete' 
-            WHERE status NOT IN ('incomplete', 'paused', 'completed', 'stopped', 'archived')
+        // Clean up any invalid chat statuses and migrate old data
+        console.log('🧹 Cleaning up and migrating chat statuses...');
+        
+        // First, migrate old status values to new ones
+        const migrationResult = await client.query(`
+            UPDATE chat SET 
+                status = CASE 
+                    WHEN status = 'incomplete' THEN 'inprogress'
+                    WHEN status = 'paused' THEN 'inprogress'
+                    WHEN status = 'stopped' THEN 'not_started'
+                    WHEN status = 'archived' THEN 'completed'
+                    ELSE status
+                END
+            WHERE status NOT IN ('not_started', 'inprogress', 'completed')
             RETURNING id, status;
         `);
         
-        if (updateResult.rows.length > 0) {
-            console.log(`📝 Updated ${updateResult.rows.length} chats with invalid status to 'incomplete'`);
+        if (migrationResult.rows.length > 0) {
+            console.log(`📝 Migrated ${migrationResult.rows.length} chats to new status values`);
         }
+
+        // Ensure current_stage and concept_name columns exist if table was created before
+        console.log('🔧 Adding missing columns if needed...');
+        await client.query(`
+            DO $$ 
+            BEGIN
+                -- Add current_stage column if it doesn't exist
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'chat' AND column_name = 'current_stage'
+                ) THEN
+                    ALTER TABLE chat ADD COLUMN current_stage INTEGER DEFAULT 0;
+                    RAISE NOTICE 'Added current_stage column';
+                END IF;
+                
+                -- Add concept_name column if it doesn't exist
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = 'chat' AND column_name = 'concept_name'
+                ) THEN
+                    ALTER TABLE chat ADD COLUMN concept_name VARCHAR(255);
+                    RAISE NOTICE 'Added concept_name column';
+                END IF;
+            END $$;
+        `);
 
         await client.query('COMMIT');
         
@@ -253,18 +321,81 @@ const createTables = async () => {
 const runUpdatesOnly = async (client) => {
     console.log('🔄 Running updates for existing tables...');
     
-    // Add status constraint if it doesn't exist
+    // Drop old constraint and add new one
+    await client.query(`
+        DO $$ 
+        BEGIN
+            -- Drop old constraint if it exists
+            IF EXISTS (
+                SELECT 1 FROM information_schema.table_constraints 
+                WHERE constraint_name = 'chk_chat_status' 
+                AND table_name = 'chat'
+            ) THEN
+                ALTER TABLE chat DROP CONSTRAINT chk_chat_status;
+                RAISE NOTICE 'Dropped old chat status constraint';
+            END IF;
+            
+            -- Add new constraint matching ChatController
+            ALTER TABLE chat ADD CONSTRAINT chk_chat_status 
+            CHECK (status IN ('not_started', 'inprogress', 'completed'));
+            RAISE NOTICE 'Added new chat status constraint';
+        END $$;
+    `);
+
+    // Add stage constraint
     await client.query(`
         DO $$ 
         BEGIN
             IF NOT EXISTS (
                 SELECT 1 FROM information_schema.table_constraints 
-                WHERE constraint_name = 'chk_chat_status' 
+                WHERE constraint_name = 'chk_chat_stage' 
                 AND table_name = 'chat'
             ) THEN
-                ALTER TABLE chat ADD CONSTRAINT chk_chat_status 
-                CHECK (status IN ('incomplete', 'paused', 'completed', 'stopped', 'archived'));
-                RAISE NOTICE 'Added chat status constraint';
+                ALTER TABLE chat ADD CONSTRAINT chk_chat_stage 
+                CHECK (current_stage >= 0 AND current_stage <= 5);
+                RAISE NOTICE 'Added chat stage constraint';
+            END IF;
+        END $$;
+    `);
+
+    // Migrate existing data
+    const migrationResult = await client.query(`
+        UPDATE chat SET 
+            status = CASE 
+                WHEN status = 'incomplete' THEN 'inprogress'
+                WHEN status = 'paused' THEN 'inprogress'
+                WHEN status = 'stopped' THEN 'not_started'
+                WHEN status = 'archived' THEN 'completed'
+                ELSE status
+            END
+        WHERE status NOT IN ('not_started', 'inprogress', 'completed')
+        RETURNING id, status;
+    `);
+    
+    if (migrationResult.rows.length > 0) {
+        console.log(`📝 Migrated ${migrationResult.rows.length} chats to new status values`);
+    }
+
+    // Add missing columns
+    await client.query(`
+        DO $$ 
+        BEGIN
+            -- Add current_stage column if it doesn't exist
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'chat' AND column_name = 'current_stage'
+            ) THEN
+                ALTER TABLE chat ADD COLUMN current_stage INTEGER DEFAULT 0;
+                RAISE NOTICE 'Added current_stage column';
+            END IF;
+            
+            -- Add concept_name column if it doesn't exist
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns 
+                WHERE table_name = 'chat' AND column_name = 'concept_name'
+            ) THEN
+                ALTER TABLE chat ADD COLUMN concept_name VARCHAR(255);
+                RAISE NOTICE 'Added concept_name column';
             END IF;
         END $$;
     `);
@@ -295,6 +426,18 @@ const runUpdatesOnly = async (client) => {
     `);
     await client.query(`
         CREATE INDEX IF NOT EXISTS idx_chat_status_created ON chat(status, created_at DESC);
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_current_stage ON chat(current_stage);
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_concept_name ON chat(concept_name);
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_user_concept ON chat(user_id, concept_name);
+    `);
+    await client.query(`
+        CREATE INDEX IF NOT EXISTS idx_chat_user_stage ON chat(user_id, current_stage);
     `);
 
     console.log('✅ Updates completed for existing tables');
@@ -341,7 +484,9 @@ if (require.main === module) {
         console.log('  ✅ Indexes: Optimized for query performance');
         console.log('  ✅ Constraints: Data integrity enforced');
         console.log('  ✅ Triggers: Auto-update timestamps');
-        console.log('  ✅ Chat statuses: incomplete, paused, completed, stopped, archived');
+        console.log('  ✅ Chat statuses: not_started, inprogress, completed');
+        console.log('  ✅ Chat stages: 0-5 with constraints');
+        console.log('  ✅ Concept support: Added concept_name column');
         console.log('\n🚀 Your database is ready for the chat application!');
     };
 
